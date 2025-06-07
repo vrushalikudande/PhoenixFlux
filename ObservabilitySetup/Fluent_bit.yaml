@@ -15,25 +15,29 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: fluent-bit-read
+  name: fluent-bit
 rules:
   - apiGroups: [""]
-    resources:
-      - pods
-      - namespaces
-    verbs:
-      - get
-      - list
-      - watch
+    resources: ["namespaces", "pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: fluent-bit-read
+  name: fluent-bit
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: fluent-bit-read
+  name: fluent-bit
 subjects:
   - kind: ServiceAccount
     name: fluent-bit
@@ -48,12 +52,14 @@ metadata:
 data:
   fluent-bit.conf: |
     [SERVICE]
-        Flush        1
-        Log_Level    debug
+        Flush        5
+        Daemon       Off
+        Log_Level    info
         Parsers_File parsers.conf
         HTTP_Server  On
         HTTP_Listen  0.0.0.0
         HTTP_Port    2020
+        storage.path /var/log/flb-storage/
 
     [INPUT]
         Name              tail
@@ -63,85 +69,92 @@ data:
         DB                /var/log/flb_kube.db
         Mem_Buf_Limit     5MB
         Skip_Long_Lines   On
+        Refresh_Interval  10
+        Read_from_Head    true
+        Rotate_Wait       30
+        Ignore_Older      30m
 
     [FILTER]
-        Name              kubernetes
-        Match             kube.*
-        Merge_Log         On
-        Keep_Log          On
-        K8S-Logging.Parser    On
-        K8S-Logging.Exclude   On
-        Kube_URL         https://kubernetes.default.svc:443
-        Kube_CA_File     /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        Kube_Token_File  /var/run/secrets/kubernetes.io/serviceaccount/token
-        Kube_Tag_Prefix  kube.var.log.containers.
-        Merge_Log_Key    log_processed
-        K8S-Logging.Parser    On
-        K8S-Logging.Exclude   On
-        tls.verify       Off
+        Name                kubernetes
+        Match               kube.*
+        kube_url            https://kubernetes.default.svc:443
+        kube_ca_file        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        kube_token_file     /var/run/secrets/kubernetes.io/serviceaccount/token
+        merge_log           On
+        keep_log            Off
+        k8s-logging.parser  On
+        k8s-logging.exclude On
+        tls.verify          Off
 
     [FILTER]
-        Name              lua
-        Match             kube.*
-        Script            anomaly_filter.lua
-        Call              filter_by_anomaly
-        Protected_Mode    false
+        Name                lua
+        Match               kube.*
+        Script              /fluent-bit/etc/anomaly_filter.lua
+        Protected_Mode      false
+        Call                process
+        Time_as_Table       true
 
     [OUTPUT]
-        Name   http
-        Match  anomaly.*
-        Host   webhook.site
-        Port   443
-        URI    /b9fbe5d5-cb1d-4470-9f9a-e6d972d50171
+        Name                http
+        Match               kube.*
+        Host                webhook.site
+        Port                443
+        URI                 /b9fbe5d5-cb1d-4470-9f9a-e6d972d50171
+        Format              json
+        Header              Content-Type application/json
+        tls                 On
+        Retry_Limit         3
+        compress            gzip
+        json_date_format    iso8601
+        json_date_key       timestamp
+
+  parsers.conf: |
+    [PARSER]
+        Name   docker
         Format json
-        Header Content-Type application/json
-        tls    On
-        Retry_Limit 3
-        storage.type  filesystem
-        storage.path  /var/log/flb-storage
-        storage.sync  normal
-        storage.checksum  off
-        storage.backlog.mem_limit  5M
+        Time_Key time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+        Time_Keep On
+
+    [PARSER]
+        Name   kubernetes
+        Format json
+        Time_Key time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+        Time_Keep On
 
   anomaly_filter.lua: |
-    function filter_by_anomaly(tag, ts, record)
+    function process(tag, timestamp, record)
         local k8s = record["kubernetes"]
-        if not k8s then 
-            print("No kubernetes metadata found in record")
-            return -1, record 
+        if not k8s then
+            return -1, record
         end
-        local ns  = k8s["namespace_name"]
+        local ns = k8s["namespace_name"]
         local pod = k8s["pod_name"]
-        if not ns or not pod then 
-            print("No namespace or pod name found in record")
-            return -1, record 
+        if not ns or not pod then
+            return -1, record
         end
         local key = ns .. "/" .. pod
-        print("Checking pod: " .. key)
-        local fh  = io.open("/var/lib/fluent-bit/shared/anomaly_pods.list", "r")
-        if not fh then 
-            print("Could not open anomaly_pods.list file at /var/lib/fluent-bit/shared/anomaly_pods.list")
-            return -1, record 
+        local fh = io.open("/var/lib/fluent-bit/shared/anomaly_pods.list", "r")
+        if not fh then
+            return -1, record
         end
         for line in fh:lines() do
             if line == key then
-                print("Found matching pod in anomaly list: " .. key)
                 fh:close()
-                local new_tag = "anomaly." .. ns .. "." .. pod
-                return 2, record, new_tag
+                record["anomaly_metadata"] = {
+                    pod_name = pod,
+                    namespace = ns,
+                    container_name = k8s["container_name"],
+                    timestamp = timestamp
+                }
+                record["severity"] = record["severity"] or "info"
+                return 2, timestamp, record
             end
         end
         fh:close()
         return -1, record
     end
-
-  parsers.conf: |
-    [PARSER]
-        Name        docker
-        Format      json
-        Time_Key    time
-        Time_Format %Y-%m-%dT%H:%M:%S.%L
-        Time_Keep   On
 ---
 # ========== FLUENT-BIT DAEMONSET ==========
 apiVersion: apps/v1
@@ -162,37 +175,36 @@ spec:
     spec:
       serviceAccountName: fluent-bit
       containers:
-      - name: fluent-bit
-        image: fluent/fluent-bit:1.9
-        resources:
-          limits:
-            memory: 500Mi
-            cpu: 200m
-          requests:
-            memory: 100Mi
-            cpu: 100m
-        volumeMounts:
-          - name: varlog
-            mountPath: /var/log
-          - name: varlibdockercontainers
-            mountPath: /var/lib/docker/containers
-            readOnly: true
-          - name: fb-config
-            mountPath: /fluent-bit/etc/fluent-bit.conf
-            subPath: fluent-bit.conf
-          - name: fb-config
-            mountPath: /fluent-bit/etc/parsers.conf
-            subPath: parsers.conf
-          - name: fb-config
-            mountPath: /fluent-bit/etc/anomaly_filter.lua
-            subPath: anomaly_filter.lua
-          - name: fb-shared
-            mountPath: /var/lib/fluent-bit/shared
-          - name: fb-storage
-            mountPath: /var/log/flb-storage
-          - name: kube-token
-            mountPath: /var/run/secrets/kubernetes.io/serviceaccount
-            readOnly: true
+        - name: fluent-bit
+          image: fluent/fluent-bit:1.9
+          resources:
+            limits:
+              memory: 500Mi
+              cpu: 200m
+            requests:
+              memory: 100Mi
+              cpu: 100m
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: fb-config
+              mountPath: /fluent-bit/etc/fluent-bit.conf
+              subPath: fluent-bit.conf
+            - name: fb-config
+              mountPath: /fluent-bit/etc/parsers.conf
+              subPath: parsers.conf
+            - name: fb-config
+              mountPath: /fluent-bit/etc/anomaly_filter.lua
+              subPath: anomaly_filter.lua
+            - name: fb-shared
+              mountPath: /var/lib/fluent-bit/shared
+            - name: fb-storage
+              mountPath: /var/log/flb-storage
       volumes:
         - name: varlog
           hostPath:
@@ -211,7 +223,3 @@ spec:
           hostPath:
             path: /var/lib/fluent-bit/storage
             type: DirectoryOrCreate
-        - name: kube-token
-          secret:
-            secretName: fluent-bit-token
-            defaultMode: 420 
