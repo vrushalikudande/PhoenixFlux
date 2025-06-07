@@ -1,0 +1,217 @@
+---
+# ========== NAMESPACE ==========
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+---
+# ========== FLUENT-BIT RBAC ==========
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: logging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit-read
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit-read
+subjects:
+  - kind: ServiceAccount
+    name: fluent-bit
+    namespace: logging
+---
+# ========== FLUENT-BIT CONFIGMAP ==========
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: logging
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush        1
+        Log_Level    debug
+        Parsers_File parsers.conf
+        HTTP_Server  On
+        HTTP_Listen  0.0.0.0
+        HTTP_Port    2020
+
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/*.log
+        Parser            docker
+        Tag               kube.*
+        DB                /var/log/flb_kube.db
+        Mem_Buf_Limit     5MB
+        Skip_Long_Lines   On
+
+    [FILTER]
+        Name              kubernetes
+        Match             kube.*
+        Merge_Log         On
+        Keep_Log          On
+        K8S-Logging.Parser    On
+        K8S-Logging.Exclude   On
+        Kube_URL         https://kubernetes.default.svc:443
+        Kube_CA_File     /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File  /var/run/secrets/kubernetes.io/serviceaccount/token
+        Kube_Tag_Prefix  kube.var.log.containers.
+        Merge_Log_Key    log_processed
+        K8S-Logging.Parser    On
+        K8S-Logging.Exclude   On
+        tls.verify       Off
+
+    [FILTER]
+        Name              lua
+        Match             kube.*
+        Script            anomaly_filter.lua
+        Call              filter_by_anomaly
+        Protected_Mode    false
+
+    [OUTPUT]
+        Name   http
+        Match  anomaly.*
+        Host   webhook.site
+        Port   443
+        URI    /b9fbe5d5-cb1d-4470-9f9a-e6d972d50171
+        Format json
+        Header Content-Type application/json
+        tls    On
+        Retry_Limit 3
+        storage.type  filesystem
+        storage.path  /var/log/flb-storage
+        storage.sync  normal
+        storage.checksum  off
+        storage.backlog.mem_limit  5M
+
+  anomaly_filter.lua: |
+    function filter_by_anomaly(tag, ts, record)
+        local k8s = record["kubernetes"]
+        if not k8s then 
+            print("No kubernetes metadata found in record")
+            return -1, record 
+        end
+        local ns  = k8s["namespace_name"]
+        local pod = k8s["pod_name"]
+        if not ns or not pod then 
+            print("No namespace or pod name found in record")
+            return -1, record 
+        end
+        local key = ns .. "/" .. pod
+        print("Checking pod: " .. key)
+        local fh  = io.open("/var/lib/fluent-bit/shared/anomaly_pods.list", "r")
+        if not fh then 
+            print("Could not open anomaly_pods.list file at /var/lib/fluent-bit/shared/anomaly_pods.list")
+            return -1, record 
+        end
+        for line in fh:lines() do
+            if line == key then
+                print("Found matching pod in anomaly list: " .. key)
+                fh:close()
+                local new_tag = "anomaly." .. ns .. "." .. pod
+                return 2, record, new_tag
+            end
+        end
+        fh:close()
+        return -1, record
+    end
+
+  parsers.conf: |
+    [PARSER]
+        Name        docker
+        Format      json
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L
+        Time_Keep   On
+---
+# ========== FLUENT-BIT DAEMONSET ==========
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: logging
+  labels:
+    k8s-app: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      k8s-app: fluent-bit
+  template:
+    metadata:
+      labels:
+        k8s-app: fluent-bit
+    spec:
+      serviceAccountName: fluent-bit
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:1.9
+        resources:
+          limits:
+            memory: 500Mi
+            cpu: 200m
+          requests:
+            memory: 100Mi
+            cpu: 100m
+        volumeMounts:
+          - name: varlog
+            mountPath: /var/log
+          - name: varlibdockercontainers
+            mountPath: /var/lib/docker/containers
+            readOnly: true
+          - name: fb-config
+            mountPath: /fluent-bit/etc/fluent-bit.conf
+            subPath: fluent-bit.conf
+          - name: fb-config
+            mountPath: /fluent-bit/etc/parsers.conf
+            subPath: parsers.conf
+          - name: fb-config
+            mountPath: /fluent-bit/etc/anomaly_filter.lua
+            subPath: anomaly_filter.lua
+          - name: fb-shared
+            mountPath: /var/lib/fluent-bit/shared
+          - name: fb-storage
+            mountPath: /var/log/flb-storage
+          - name: kube-token
+            mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+            readOnly: true
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: fb-config
+          configMap:
+            name: fluent-bit-config
+        - name: fb-shared
+          hostPath:
+            path: /var/lib/fluent-bit/shared
+            type: DirectoryOrCreate
+        - name: fb-storage
+          hostPath:
+            path: /var/lib/fluent-bit/storage
+            type: DirectoryOrCreate
+        - name: kube-token
+          secret:
+            secretName: fluent-bit-token
+            defaultMode: 420 

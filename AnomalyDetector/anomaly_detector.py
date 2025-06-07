@@ -1,9 +1,11 @@
 import requests
 import pandas as pd
 from sklearn.ensemble import IsolationForest
+import time
+import argparse
 
 #PROMETHEUS_URL = "http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090"
-PROMETHEUS_URL = "http://localhost:9090"
+PROMETHEUS_URL = "http://prometheus.prometheus.svc.cluster.local:9090"
 # Define PromQL metrics as features
 PROMQL_METRICS = {
     "restart_rate": 'increase(kube_pod_container_status_restarts_total[5m])',
@@ -71,27 +73,61 @@ def run_isolation_forest(pod_vectors, contamination=0.1):
 
     anomalies = df[df['anomaly_flag'] == -1]
     return anomalies
+
+def write_anomaly_pods_list(anomalies):
+    """Write the list of anomalous pods to a file for Fluent-Bit to use."""
+    try:
+        with open("/fluent-bit/etc/shared/anomaly_pods.list", "w") as f:
+            for _, row in anomalies.iterrows():
+                pod_key = f"{row['namespace']}/{row['pod']}"
+                f.write(f"{pod_key}\n")
+        print(f"Updated anomaly pods list with {len(anomalies)} entries")
+    except Exception as e:
+        print(f"[ERROR] Failed to write anomaly pods list: {str(e)}")
     
 if __name__ == "__main__":
-    print("\n Fetching Prometheus metrics...")
-    feature_data = build_feature_vectors()
+    parser = argparse.ArgumentParser(description='Anomaly Detector for Kubernetes Pods')
+    parser.add_argument('--interval', type=int, default=60,
+                      help='Detection interval in seconds (default: 60)')
+    args = parser.parse_args()
+    
+    print(f"Starting anomaly detector with {args.interval}s interval...")
+    
+    while True:
+        try:
+            print("\nFetching Prometheus metrics...")
+            feature_data = build_feature_vectors()
 
-    if not feature_data:
-        print("No metrics found, check Prometheus/KSM setup.")
-        exit(1)
+            if not feature_data:
+                print("No metrics found, check Prometheus/KSM setup.")
+                time.sleep(args.interval)
+                continue
 
-    print(f"Total pods processed: {len(feature_data)}")
+            print(f"Total pods processed: {len(feature_data)}")
 
-    anomalies = run_isolation_forest(feature_data)
+            anomalies = run_isolation_forest(feature_data)
 
-    if anomalies.empty:
-        print("No anomalies detected.")
-    else:
-        print("\n Anomalies Detected:\n")
-        for _, row in anomalies.iterrows():
-            print(f" Pod: {row['pod']}  | NS: {row['namespace']} | Score: {row['anomaly_score']:.3f}")
-            print(" Feature vector:")
-            for f in PROMQL_METRICS:
-                key = "container_ready_flag" if f == "container_ready_flag_raw" else f
-                print(f"  - {key:30s}: {row[key]}")
-            print("-" * 50)
+            if anomalies.empty:
+                print("No anomalies detected.")
+                # Clear the anomaly pods list if no anomalies are detected
+                write_anomaly_pods_list(anomalies)
+            else:
+                print("\nAnomalies Detected:\n")
+                for _, row in anomalies.iterrows():
+                    print(f" Pod: {row['pod']}  | NS: {row['namespace']} | Score: {row['anomaly_score']:.3f}")
+                    print(" Feature vector:")
+                    for f in PROMQL_METRICS:
+                        key = "container_ready_flag" if f == "container_ready_flag_raw" else f
+                        print(f"  - {key:30s}: {row[key]}")
+                    print("-" * 50)
+                
+                # Update the anomaly pods list with the detected anomalies
+                write_anomaly_pods_list(anomalies)
+            
+            print(f"\nWaiting {args.interval} seconds until next detection cycle...")
+            time.sleep(args.interval)
+            
+        except Exception as e:
+            print(f"[ERROR] An error occurred during detection cycle: {str(e)}")
+            print(f"Retrying in {args.interval} seconds...")
+            time.sleep(args.interval)
