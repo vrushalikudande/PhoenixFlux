@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decision-engine
+  namespace: logging
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: decision-engine
+  template:
+    metadata:
+      labels:
+        app: decision-engine
+    spec:
+      containers:
+      - name: decision-engine
+        image: vrushalikudande/decision-engine  # Replace with your built image location!
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: REDIS_HOST
+          value: "redis.logging.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: REDIS_DB
+          value: "0"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: decision-engine
+  namespace: logging
+spec:
+  selector:
+    app: decision-engine
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP

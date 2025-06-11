@@ -1,4 +1,3 @@
----
 # ========== NAMESPACE ==========
 apiVersion: v1
 kind: Namespace
@@ -60,7 +59,6 @@ data:
         HTTP_Listen  0.0.0.0
         HTTP_Port    2020
         storage.path /var/log/flb-storage/
-
     [INPUT]
         Name              tail
         Path              /var/log/containers/*.log
@@ -73,7 +71,6 @@ data:
         Read_from_Head    true
         Rotate_Wait       30
         Ignore_Older      30m
-
     [FILTER]
         Name                kubernetes
         Match               kube.*
@@ -85,7 +82,6 @@ data:
         k8s-logging.parser  On
         k8s-logging.exclude On
         tls.verify          Off
-
     [FILTER]
         Name                lua
         Match               kube.*
@@ -93,21 +89,19 @@ data:
         Protected_Mode      false
         Call                process
         Time_as_Table       true
-
+ 
     [OUTPUT]
         Name                http
         Match               kube.*
-        Host                webhook.site
-        Port                443
-        URI                 /b9fbe5d5-cb1d-4470-9f9a-e6d972d50171
+        Host                decision-engine.logging.svc.cluster.local
+        Port                8080
+        URI                 /logs
         Format              json
         Header              Content-Type application/json
-        tls                 On
         Retry_Limit         3
-        compress            gzip
         json_date_format    iso8601
         json_date_key       timestamp
-
+        log_response_payload On
   parsers.conf: |
     [PARSER]
         Name   docker
@@ -115,14 +109,12 @@ data:
         Time_Key time
         Time_Format %Y-%m-%dT%H:%M:%S.%L%z
         Time_Keep On
-
     [PARSER]
         Name   kubernetes
         Format json
         Time_Key time
         Time_Format %Y-%m-%dT%H:%M:%S.%L%z
         Time_Keep On
-
   anomaly_filter.lua: |
     function process(tag, timestamp, record)
         local k8s = record["kubernetes"]
@@ -176,7 +168,7 @@ spec:
       serviceAccountName: fluent-bit
       containers:
         - name: fluent-bit
-          image: fluent/fluent-bit:1.9
+          image: fluent/fluent-bit:1.9.10-debug
           resources:
             limits:
               memory: 500Mi
